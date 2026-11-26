@@ -1,17 +1,20 @@
-"""Этап 2. Шесть автоматических правил проверки качества yield_df.csv.
+"""Этап 2. Пять автоматических правил проверки качества yield_df.csv.
 
 Правило получает таблицу, ничего в ней не меняет и возвращает:
   mask    - True у строк-нарушителей (понадобится для оценки полноты обнаружения)
   metrics - числа для сверки с этапом 1
 
-  R1 key_unique       ключ (Area, Item, Year) не повторяется
-  R2 temp_consistent  одна температура на пару (Area, Year)
-  R3 ranges           значения в допустимых диапазонах; выбросы IQR внутри культуры
+  R1 key_unique       ключ (Area, Item, Year) не повторяется            (дефект 1)
+  R2 temp_consistent  одна температура на пару (Area, Year)             (дефект 3)
+  R3 outliers_skew    выбросы IQR внутри культуры; асимметрия столбцов  (дефекты 4 и 5)
   R4 missing          нет пропусков и нечисловых значений
-  R5 constancy        осадки не постоянны внутри страны
-  R6 names            названия записаны единообразно
+  R5 constancy        осадки не постоянны внутри страны                 (дефект 2)
+                      (если столбца осадков нет, правило не применимо: нарушений 0)
 
-Запуск: python quality_checks.py data/yield_df.csv
+Асимметрия считается по столбцу целиком, строк-нарушителей у неё нет. Она даёт только
+предупреждение и в оценку полноты обнаружения (задача 5) не входит.
+
+Запуск: python3 quality_checks.py data/yield_df.csv
 """
 import sys
 from dataclasses import dataclass
@@ -24,34 +27,17 @@ RAIN = "average_rain_fall_mm_per_year"
 PEST = "pesticides_tonnes"
 TEMP = "avg_temp"
 NUMERIC = ["Year", TARGET, RAIN, PEST, TEMP]
-ITEMS = {"Cassava", "Maize", "Plantains and others", "Potatoes", "Rice, paddy",
-         "Sorghum", "Soybeans", "Sweet potatoes", "Wheat", "Yams"}
 
-# Допустимые диапазоны (min, max). Широкие: ловим невозможное, а не редкое.
-RANGES = {"Year": (1990, 2013), TARGET: (1, 1_000_000), RAIN: (0, 5000),
-          PEST: (0, 1_000_000), TEMP: (-50, 50)}
 IQR_K = 1.5
+SKEW_COLS = [TARGET, PEST]   # столбцы, для которых проверяем асимметрию (дефекты 4 и 5)
+SKEW_LIMIT = 1.0             # |асимметрия| выше порога даёт предупреждение
 
 
 def load_data(path):
     return pd.read_csv(path).drop(columns="Unnamed: 0", errors="ignore")
 
 
-def norm_name(s):
-    """Название без лишних пробелов и в нижнем регистре."""
-    return s.astype("string").str.strip().str.replace(r"\s+", " ", regex=True).str.casefold()
-
-
 # ---------------------------------------------------------------- маски
-def hard_range_mask(df):
-    """Невозможные значения (пропуски сюда не входят, это R4)."""
-    bad = pd.Series(False, index=df.index)
-    for col, (lo, hi) in RANGES.items():
-        x = pd.to_numeric(df[col], errors="coerce")
-        bad |= x.notna() & ~x.between(lo, hi)
-    return bad
-
-
 def outlier_mask(df):
     """Выбросы урожайности по правилу IQR внутри своей культуры."""
     g = df[TARGET].groupby(df["Item"])
@@ -67,7 +53,8 @@ def missing_mask(df):
     for col in ["Area", "Item"]:
         bad |= df[col].isna() | (df[col].astype("string").str.strip() == "")
     for col in NUMERIC:
-        bad |= pd.to_numeric(df[col], errors="coerce").isna()
+        if col in df.columns:   # после полной очистки столбца осадков уже нет (шаг R5)
+            bad |= pd.to_numeric(df[col], errors="coerce").isna()
     return bad
 
 
@@ -85,7 +72,7 @@ def rule_key_unique(df):
         "extra_rows": extra,
         "keys_temp_differs": len(gap),
         "keys_yield_differs": int((g.n_yield > 1).sum()),
-        "median_temp_gap": round(float(gap.median()), 2),
+        "median_temp_gap": round(float(gap.median()), 2) if len(gap) else 0.0,
         "full_duplicates": int(df.duplicated().sum()),
     }
 
@@ -97,14 +84,17 @@ def rule_temp_consistent(df):
                   "area_year_multi_temp": int(((g.max() - g.min()) > 1e-9).sum())}
 
 
-def rule_ranges(df):
-    hard, out = hard_range_mask(df), outlier_mask(df)
+def rule_outliers_skew(df):
+    """Строки-нарушители: выбросы IQR. Асимметрия идёт в метрики и в предупреждение."""
+    out = outlier_mask(df)
     share = (out.groupby(df["Item"]).mean() * 100).round(1)
-    metrics = {"hard_range_rows": int(hard.sum()), "outlier_rows": int(out.sum()),
-               "skew_yield": round(float(df[TARGET].skew()), 2),
-               "skew_pest": round(float(df[PEST].skew()), 2)}
+    skew = {col: float(pd.to_numeric(df[col], errors="coerce").skew()) for col in SKEW_COLS}
+    metrics = {"outlier_rows": int(out.sum()),
+               "skew_yield": round(skew[TARGET], 2),
+               "skew_pest": round(skew[PEST], 2),
+               "skewed_cols": sum(abs(v) > SKEW_LIMIT for v in skew.values())}
     metrics.update({f"outlier_share_{item}": v for item, v in share.items()})
-    return hard | out, metrics
+    return out, metrics
 
 
 def rule_missing(df):
@@ -113,32 +103,22 @@ def rule_missing(df):
 
 
 def rule_constancy(df):
+    if RAIN not in df.columns:   # столбец удалён очисткой: правило не применимо, нарушений нет
+        return pd.Series(False, index=df.index), {"areas": df["Area"].nunique(),
+                                                  "areas_rain_const": 0, "areas_rain_varies": 0}
     n = df.groupby("Area")[RAIN].nunique()
     const = n[n == 1].index
     return df["Area"].isin(const), {"areas": len(n), "areas_rain_const": len(const),
                                     "areas_rain_varies": len(n) - len(const)}
 
 
-def rule_names(df):
-    """Нарушение: лишние пробелы, редкое написание при нескольких (регистр),
-    культура вне списка ITEMS."""
-    mask = ~df["Item"].isin(ITEMS) & df["Item"].notna()
-    for col in ["Area", "Item"]:
-        raw = df[col].astype("string")
-        dominant = raw.groupby(norm_name(raw)).transform(lambda s: s.mode().iloc[0])
-        spaces = raw != raw.str.strip().str.replace(r"\s+", " ", regex=True)
-        mask |= (raw.notna() & ((raw != dominant) | spaces)).fillna(False)
-    return mask, {"rows_bad_names": int(mask.sum())}
-
-
 # id: (имя, серьёзность, функция)
 RULES = {
     "R1": ("key_unique", "error", rule_key_unique),
     "R2": ("temp_consistent", "error", rule_temp_consistent),
-    "R3": ("ranges", "warning", rule_ranges),
+    "R3": ("outliers_skew", "warning", rule_outliers_skew),
     "R4": ("missing", "error", rule_missing),
     "R5": ("constancy", "error", rule_constancy),
-    "R6": ("names", "error", rule_names),
 }
 
 
@@ -155,7 +135,8 @@ class Result:
 
     @property
     def status(self):
-        if self.n_rows == 0:
+        # строк-нарушителей нет и асимметрии нет -> OK
+        if self.n_rows == 0 and not self.metrics.get("skewed_cols", 0):
             return "OK"
         return "FAIL" if self.severity == "error" else "WARN"
 
@@ -164,8 +145,6 @@ def run_all(df):
     results = {}
     for rid, (name, severity, fn) in RULES.items():
         mask, metrics = fn(df)
-        if rid == "R3" and metrics["hard_range_rows"]:
-            severity = "error"          # невозможные значения это уже ошибка, а не выбросы
         results[rid] = Result(name, severity, mask.astype(bool), metrics)
     return results
 
@@ -185,12 +164,11 @@ STAGE1 = [
     ("R1", "keys_temp_differs", 3690), ("R1", "keys_yield_differs", 0),
     ("R1", "median_temp_gap", 4.49), ("R1", "full_duplicates", 2310),
     ("R2", "area_year_total", 2250), ("R2", "area_year_multi_temp", 575),
-    ("R3", "hard_range_rows", 0), ("R3", "skew_yield", 1.79), ("R3", "skew_pest", 3.49),
+    ("R3", "skew_yield", 1.79), ("R3", "skew_pest", 3.49),
     ("R3", "outlier_share_Wheat", 8.6), ("R3", "outlier_share_Plantains and others", 7.6),
     ("R3", "outlier_share_Maize", 5.0),
     ("R4", "rows_with_missing", 0),
     ("R5", "areas_rain_const", 101), ("R5", "areas_rain_varies", 0),
-    ("R6", "rows_bad_names", 0),
 ]
 
 
