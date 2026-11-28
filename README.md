@@ -122,3 +122,15 @@
 - **Воспроизводимость:** фиксированный seed, логирование экспериментов.
 - **Анализ ошибок:** по странам и культурам, график остатков, важность признаков, при наличии координат карта ошибок по странам.
 - **Валидация:** разбиение по странам (GroupKFold); предобработка внутри `Pipeline` только на обучающей части.
+ 
+ ## 8. Структура проекта и порядок запуска
+
+| Этап | Файл | Назначение | Команда запуска |
+|------|------|------------|-----------------|
+| 1 | `analysis.ipynb` | Профилирование `yield_df.csv` и расчёт дефектов | Запуск в Jupyter |
+| 2 | `quality_checks.py` | Пять правил проверки (R1–R5), отчёт, сверка с этапом 1 | `python3 quality_checks.py data/yield_df.csv` |
+| 2 (тесты) | `test_quality_checks.py` | 10 мини-тестов правил R1–R5 | `python3 test_quality_checks.py` |
+| 3 | `cleaning.py` | Очистка данных, журнал шагов, 3 состояния данных | `python3 cleaning.py data/yield_df.csv` |
+| 4 | `corruption.py` | Контролируемая порча (5 %), 8 мини-тестов, оценка полноты | `python3 corruption.py data/yield_clean.csv` |
+| 5 | `experiment_a.py` | Эксперимент A (Ridge, RF, HGB; GroupKFold по странам) | `python3 experiment_a.py data/yield_df.csv` |
+| 6 | `analysis_plots.py` | Графики (рис. 3–9), ошибки по странам/культурам, важность признаков | `python3 analysis_plots.py data/yield_df.csv` |
